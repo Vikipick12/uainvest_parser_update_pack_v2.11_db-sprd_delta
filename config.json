@@ -1,0 +1,43 @@
+{
+    "exchanges": [
+        "gate",
+        "bybit",
+        "mexc"
+    ],
+    "all_exchanges": [
+        "aster",
+        "backpack",
+        "balpha",
+        "binance",
+        "bingx",
+        "bitget",
+        "bitmart",
+        "bitrue",
+        "bybit",
+        "coinex",
+        "edgex",
+        "extended",
+        "gate",
+        "hotcoin",
+        "htx",
+        "hyperliquid",
+        "kucoin",
+        "lbank",
+        "lighter",
+        "mexc",
+        "okx",
+        "ourbit",
+        "paradex",
+        "phemex",
+        "variational",
+        "weex",
+        "whitebit",
+        "xt"
+    ],
+    "min_spread_pct": 4.0,
+    "data_path": "data.json",
+    "last_spreads": [],
+    "updated_at": 1755096052
+}
+
+
