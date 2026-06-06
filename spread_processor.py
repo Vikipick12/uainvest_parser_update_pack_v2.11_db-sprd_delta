@@ -1,8 +1,13 @@
 import json
 import argparse
+import re
 from dataclasses import dataclass, asdict
 from typing import Any, Dict, List, Optional, Iterable
 from config_manager import load_config, save_spreads_cache, update_settings
+
+
+UAINVEST_ARBITRAGE_BASE_URL = "https://uainvest.com.ua/arbitrage"
+QUOTE_SUFFIXES = ("fdusd", "usdt", "usdc", "busd", "usd")
 
 
 @dataclass
@@ -24,6 +29,7 @@ class OfferSpread:
     open_spread_percentage: Optional[float]
     long_volume_usdt: Optional[float]
     short_volume_usdt: Optional[float]
+    chart_url: str
 
 
 def _to_float(value: Any) -> Optional[float]:
@@ -33,6 +39,61 @@ def _to_float(value: Any) -> Optional[float]:
         return float(value)
     except (TypeError, ValueError):
         return None
+
+
+def _market_type_slug(value: Any) -> str:
+    cleaned = str(value or "").strip().lower()
+    return re.sub(r"[^a-z0-9]+", "-", cleaned).strip("-") or "swap"
+
+
+def _coin_slug_part(value: Any) -> str:
+    cleaned = str(value or "").strip().lower()
+    cleaned = re.sub(r"[^a-z0-9:_]", "", cleaned)
+    for suffix in QUOTE_SUFFIXES:
+        if cleaned.endswith(suffix) and len(cleaned) > len(suffix):
+            cleaned = cleaned[: -len(suffix)]
+            break
+    return cleaned
+
+
+def _build_coin_slug(main_coin: str, long_coin: str, short_coin: str) -> str:
+    exchange_coins = [coin for coin in (long_coin, short_coin) if coin]
+    namespaced = [coin for coin in exchange_coins if ":" in coin]
+
+    if namespaced:
+        base_parts = [coin.rsplit(":", 1)[-1] for coin in exchange_coins]
+        if main_coin and all(part == main_coin for part in base_parts if part):
+            return main_coin
+
+        ordered = namespaced + [coin for coin in exchange_coins if ":" not in coin]
+        coin = ordered[0]
+        for part in ordered[1:]:
+            part_base = part.rsplit(":", 1)[-1]
+            coin_bases = [item.rsplit(":", 1)[-1] for item in coin.split("_")]
+            if part != coin and part_base not in coin_bases:
+                coin = f"{coin}_{part}"
+        return coin
+
+    return main_coin or (exchange_coins[0] if exchange_coins else "unknown")
+
+
+def build_uainvest_chart_url(offer: Dict[str, Any]) -> str:
+    long_item = offer.get("long_item") or {}
+    short_item = offer.get("short_item") or {}
+
+    main_coin = _coin_slug_part(offer.get("symbol"))
+    long_coin = _coin_slug_part(long_item.get("symbol"))
+    short_coin = _coin_slug_part(short_item.get("symbol"))
+
+    coin = _build_coin_slug(main_coin, long_coin, short_coin)
+
+    long_exchange = str(offer.get("long") or long_item.get("exchange", "")).strip().lower()
+    short_exchange = str(offer.get("short") or short_item.get("exchange", "")).strip().lower()
+    long_type = _market_type_slug(long_item.get("type"))
+    short_type = _market_type_slug(short_item.get("type"))
+
+    slug = f"{coin}-{long_exchange}-{long_type}-{short_exchange}-{short_type}"
+    return f"{UAINVEST_ARBITRAGE_BASE_URL}/{slug}"
 
 
 def load_offers_from_file(path: str = "data.json") -> List[Dict[str, Any]]:
@@ -78,6 +139,7 @@ def compute_offer_spread(offer: Dict[str, Any]) -> Optional[OfferSpread]:
         open_spread_percentage=_to_float(offer.get("open_spread_percentage")),
         long_volume_usdt=long_vol,
         short_volume_usdt=short_vol,
+        chart_url=build_uainvest_chart_url(offer),
     )
 
 

@@ -189,6 +189,10 @@ def format_spread_card(r: dict) -> str:
         f"Об'єм на {r.get('long_exchange')}: {_fmt_money(long_vol)}\n"
         f"Об'єм на {r.get('short_exchange')}: {_fmt_money(short_vol)}"
     )
+
+    chart_url = r.get("chart_url")
+    if chart_url:
+        text += f"\nГрафік: <a href=\"{chart_url}\">відкрити</a>"
     
     if funding_text:
         text += f"\n{funding_text}"
