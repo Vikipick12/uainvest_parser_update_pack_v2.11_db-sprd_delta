@@ -38,6 +38,7 @@ def init_db(db_path: str = DEFAULT_DB_PATH) -> None:
                 user_id         INTEGER PRIMARY KEY,
                 min_spread_pct  REAL,
                 exchanges_json  TEXT,
+                exchange_min_spreads_json TEXT,
                 delta_threshold_pct REAL,
                 updated_at      INTEGER NOT NULL,
                 FOREIGN KEY(user_id) REFERENCES users(user_id) ON DELETE CASCADE
@@ -49,6 +50,8 @@ def init_db(db_path: str = DEFAULT_DB_PATH) -> None:
         existing_cols = {row[1] for row in cur.fetchall()}
         if "delta_threshold_pct" not in existing_cols:
             cur.execute("ALTER TABLE user_settings ADD COLUMN delta_threshold_pct REAL")
+        if "exchange_min_spreads_json" not in existing_cols:
+            cur.execute("ALTER TABLE user_settings ADD COLUMN exchange_min_spreads_json TEXT")
 
         # Per-opportunity state
         cur.execute(
@@ -125,12 +128,21 @@ def get_user_settings(
     try:
         cur = conn.cursor()
         cur.execute(
-            "SELECT min_spread_pct, exchanges_json, delta_threshold_pct FROM user_settings WHERE user_id=?",
+            """
+            SELECT min_spread_pct, exchanges_json, exchange_min_spreads_json, delta_threshold_pct
+            FROM user_settings
+            WHERE user_id=?
+            """,
             (user_id,),
         )
         row = cur.fetchone()
         if not row:
-            return {"min_spread_pct": None, "exchanges": None, "delta_threshold_pct": None}
+            return {
+                "min_spread_pct": None,
+                "exchanges": None,
+                "exchange_min_spreads": {},
+                "delta_threshold_pct": None,
+            }
         exchanges = None
         if row["exchanges_json"]:
             try:
@@ -139,9 +151,22 @@ def get_user_settings(
                     exchanges = [str(x) for x in parsed]
             except json.JSONDecodeError:
                 exchanges = None
+        exchange_min_spreads: Dict[str, float] = {}
+        if row["exchange_min_spreads_json"]:
+            try:
+                parsed_spreads = json.loads(row["exchange_min_spreads_json"])  # type: ignore[arg-type]
+                if isinstance(parsed_spreads, dict):
+                    exchange_min_spreads = {
+                        str(k).strip().lower(): float(v)
+                        for k, v in parsed_spreads.items()
+                        if str(k).strip()
+                    }
+            except (TypeError, ValueError, json.JSONDecodeError):
+                exchange_min_spreads = {}
         return {
             "min_spread_pct": row["min_spread_pct"],
             "exchanges": exchanges,
+            "exchange_min_spreads": exchange_min_spreads,
             "delta_threshold_pct": row["delta_threshold_pct"],
         }
     finally:
@@ -276,6 +301,75 @@ def upsert_last_spread_pct(
             (user_id, symbol, long_exchange, short_exchange, float(last_spread_pct), now),
         )
         conn.commit()
+    finally:
+        conn.close()
+
+
+def set_user_exchange_min_spread(
+    user_id: int,
+    exchange: str,
+    value: float,
+    *,
+    db_path: str = DEFAULT_DB_PATH,
+) -> None:
+    settings = get_user_settings(user_id, db_path=db_path)
+    exchange_min_spreads = dict(settings.get("exchange_min_spreads") or {})
+    normalized_exchange = str(exchange).strip().lower()
+    if not normalized_exchange:
+        return
+    exchange_min_spreads[normalized_exchange] = float(value)
+    exchange_min_spreads_json = json.dumps(exchange_min_spreads, ensure_ascii=False, sort_keys=True)
+
+    now = int(time.time())
+    conn = _connect(db_path)
+    try:
+        cur = conn.cursor()
+        cur.execute(
+            """
+            INSERT INTO user_settings (user_id, exchange_min_spreads_json, updated_at)
+            VALUES (?, ?, ?)
+            ON CONFLICT(user_id) DO UPDATE SET
+                exchange_min_spreads_json=excluded.exchange_min_spreads_json,
+                updated_at=excluded.updated_at
+            """,
+            (user_id, exchange_min_spreads_json, now),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def delete_user_exchange_min_spread(
+    user_id: int,
+    exchange: str,
+    *,
+    db_path: str = DEFAULT_DB_PATH,
+) -> bool:
+    settings = get_user_settings(user_id, db_path=db_path)
+    exchange_min_spreads = dict(settings.get("exchange_min_spreads") or {})
+    normalized_exchange = str(exchange).strip().lower()
+    if normalized_exchange not in exchange_min_spreads:
+        return False
+
+    exchange_min_spreads.pop(normalized_exchange, None)
+    exchange_min_spreads_json = json.dumps(exchange_min_spreads, ensure_ascii=False, sort_keys=True)
+
+    now = int(time.time())
+    conn = _connect(db_path)
+    try:
+        cur = conn.cursor()
+        cur.execute(
+            """
+            INSERT INTO user_settings (user_id, exchange_min_spreads_json, updated_at)
+            VALUES (?, ?, ?)
+            ON CONFLICT(user_id) DO UPDATE SET
+                exchange_min_spreads_json=excluded.exchange_min_spreads_json,
+                updated_at=excluded.updated_at
+            """,
+            (user_id, exchange_min_spreads_json, now),
+        )
+        conn.commit()
+        return True
     finally:
         conn.close()
 

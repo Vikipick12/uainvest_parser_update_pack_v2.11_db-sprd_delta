@@ -147,8 +147,14 @@ def filter_spreads_by_exchanges(
     offers: Iterable[Dict[str, Any]],
     allowed_exchanges: Iterable[str],
     min_spread_pct: float = 0.0,
+    exchange_min_spreads: Optional[Dict[str, float]] = None,
 ) -> List[OfferSpread]:
     allowed = {e.strip().lower() for e in allowed_exchanges if e and str(e).strip()}
+    exchange_thresholds = {
+        str(exchange).strip().lower(): float(value)
+        for exchange, value in (exchange_min_spreads or {}).items()
+        if str(exchange).strip()
+    }
     results: List[OfferSpread] = []
 
     for offer in offers:
@@ -157,7 +163,12 @@ def filter_spreads_by_exchanges(
 
         if long_ex in allowed and short_ex in allowed:
             spread = compute_offer_spread(offer)
-            if spread and spread.spread_pct >= min_spread_pct:
+            effective_min_pct = max(
+                float(min_spread_pct),
+                exchange_thresholds.get(long_ex, float(min_spread_pct)),
+                exchange_thresholds.get(short_ex, float(min_spread_pct)),
+            )
+            if spread and spread.spread_pct >= effective_min_pct:
                 results.append(spread)
 
     # Sort by spread percentage descending
@@ -169,10 +180,11 @@ def get_spreads_for_exchanges(
     exchanges: List[str],
     *,
     min_spread_pct: float = 0.0,
+    exchange_min_spreads: Optional[Dict[str, float]] = None,
     path: str = "data.json",
 ) -> List[Dict[str, Any]]:
     offers = load_offers_from_file(path)
-    spreads = filter_spreads_by_exchanges(offers, exchanges, min_spread_pct)
+    spreads = filter_spreads_by_exchanges(offers, exchanges, min_spread_pct, exchange_min_spreads)
     return [asdict(s) for s in spreads]
 
 

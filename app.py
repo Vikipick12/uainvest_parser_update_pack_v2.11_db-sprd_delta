@@ -8,6 +8,7 @@ from dotenv import load_dotenv
 from aiogram import Bot, Dispatcher, F
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
+from aiogram.exceptions import TelegramRetryAfter
 from aiogram.types import Message, CallbackQuery, BotCommand
 from aiogram.filters import CommandStart, Command
 from aiogram.fsm.context import FSMContext
@@ -22,6 +23,8 @@ from db import (
     set_user_min_spread,
     set_user_exchanges,
     set_user_delta_threshold,
+    set_user_exchange_min_spread,
+    delete_user_exchange_min_spread,
     get_last_spread_pct,
     upsert_last_spread_pct,
     upsert_user_token_blacklist,
@@ -38,6 +41,9 @@ load_dotenv()
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 ALLOWED_IDS_ENV = os.getenv("TELEGRAM_ALLOWED_USER_IDS", "").strip()
 FETCH_INTERVAL_SECONDS = int(os.getenv("FETCH_INTERVAL_SECONDS", "15"))
+SEND_MESSAGE_DELAY_SECONDS = float(os.getenv("SEND_MESSAGE_DELAY_SECONDS", "1.1"))
+FLOOD_RETRY_BUFFER_SECONDS = float(os.getenv("FLOOD_RETRY_BUFFER_SECONDS", "1.0"))
+MAX_ALERTS_PER_CYCLE = int(os.getenv("MAX_ALERTS_PER_CYCLE", "20"))
 
 if not TELEGRAM_BOT_TOKEN:
     raise RuntimeError("TELEGRAM_BOT_TOKEN is not set in .env")
@@ -105,9 +111,11 @@ def get_effective_settings_for_user(user_id: int) -> Dict[str, object]:
     min_spread_pct = float(user_min) if user_min is not None else float(cfg.get("min_spread_pct", 0.0))
     user_delta = user_cfg.get("delta_threshold_pct") if user_cfg else None
     delta_threshold_pct = float(user_delta) if user_delta is not None else 1.0
+    exchange_min_spreads = user_cfg.get("exchange_min_spreads") if user_cfg else {}
     return {
         "exchanges": exchanges,
         "min_spread_pct": min_spread_pct,
+        "exchange_min_spreads": exchange_min_spreads or {},
         "delta_threshold_pct": delta_threshold_pct,
         "data_path": str(cfg.get("data_path", "data.json")),
         "all_exchanges": all_exchanges,
@@ -207,6 +215,20 @@ async def ensure_allowed(message: Message) -> bool:
     return True
 
 
+async def send_message_limited(chat_id: int, text: str) -> None:
+    while True:
+        try:
+            await bot.send_message(chat_id, text)
+            if SEND_MESSAGE_DELAY_SECONDS > 0:
+                await asyncio.sleep(SEND_MESSAGE_DELAY_SECONDS)
+            return
+        except TelegramRetryAfter as e:
+            retry_after = float(getattr(e, "retry_after", 1))
+            wait_seconds = retry_after + FLOOD_RETRY_BUFFER_SECONDS
+            logger.warning("Telegram flood control for chat %s, retrying in %.1f seconds", chat_id, wait_seconds)
+            await asyncio.sleep(wait_seconds)
+
+
 async def start_background_loop(chat_id: int, user_id: int):
     while True:
         try:
@@ -214,18 +236,22 @@ async def start_background_loop(chat_id: int, user_id: int):
             rows = get_spreads_for_exchanges(
                 eff.get("exchanges", []),
                 min_spread_pct=float(eff.get("min_spread_pct", 0.0)),
+                exchange_min_spreads=eff.get("exchange_min_spreads", {}),
                 path=str(eff.get("data_path", "data.json")),
             )
             if not rows:
                 # Send the 'no offers' message only once until results appear again
                 if not no_spreads_notified.get(chat_id, False):
-                    await bot.send_message(chat_id, "Немає спредів за заданими фільтрами.")
+                    await send_message_limited(chat_id, "Немає спредів за заданими фільтрами.")
                     no_spreads_notified[chat_id] = True
             else:
                 no_spreads_notified[chat_id] = False
                 # Send each opportunity as a separate message
                 delta_threshold = float(eff.get("delta_threshold_pct", 1.0))
+                sent_count = 0
                 for r in rows:
+                    if MAX_ALERTS_PER_CYCLE > 0 and sent_count >= MAX_ALERTS_PER_CYCLE:
+                        break
                     try:
                         current = float(r.get("spread_pct", 0.0))
                         symbol = str(r.get("symbol", ""))
@@ -243,8 +269,9 @@ async def start_background_loop(chat_id: int, user_id: int):
                             if abs(current - float(last)) >= delta_threshold:
                                 should_send = True
                         if should_send:
-                            await bot.send_message(chat_id, format_spread_card(r))
+                            await send_message_limited(chat_id, format_spread_card(r))
                             upsert_last_spread_pct(user_id, symbol, long_ex, short_ex, current)
+                            sent_count += 1
                     except Exception as inner_e:  # noqa: BLE001
                         logger.exception("Помилка обробки можливості: %s", inner_e)
         except asyncio.CancelledError:
@@ -252,7 +279,7 @@ async def start_background_loop(chat_id: int, user_id: int):
             break
         except Exception as e:  # noqa: BLE001
             logger.exception("Помилка у фоному циклі: %s", e)
-            await bot.send_message(chat_id, f"Виникла помилка у фоні: {e}")
+            await send_message_limited(chat_id, f"Виникла помилка у фоні: {e}")
             break
         await asyncio.sleep(FETCH_INTERVAL_SECONDS)
 
@@ -390,6 +417,73 @@ def _parse_blacklist_duration_hours(raw: str) -> Optional[int]:
         return None
 
 
+def _normalize_exchange(raw: str) -> Optional[str]:
+    exchange = str(raw or "").strip().lower()
+    allowed = {ex.lower() for ex in ALL_EXCHANGES}
+    return exchange if exchange in allowed else None
+
+
+@dp.message(Command("set_exchange_spread"))
+async def cmd_set_exchange_spread(message: Message):
+    if not await ensure_allowed(message):
+        return
+    parts = (message.text or "").strip().split()
+    if len(parts) < 3:
+        await message.answer("Використання: /set_exchange_spread mexc 10")
+        return
+
+    exchange = _normalize_exchange(parts[1])
+    if exchange is None:
+        await message.answer("Невідома біржа. Приклад: /set_exchange_spread mexc 10")
+        return
+
+    value = _parse_percent(parts[2])
+    if value is None or value < 0:
+        await message.answer("Некоректний відсоток. Приклад: /set_exchange_spread bybit 3")
+        return
+
+    set_user_exchange_min_spread(message.from_user.id, exchange, value)
+    await message.answer(f"Мінімальний спред для {exchange} встановлено на {value:.2f}%")
+
+
+@dp.message(Command("reset_exchange_spread"))
+async def cmd_reset_exchange_spread(message: Message):
+    if not await ensure_allowed(message):
+        return
+    parts = (message.text or "").strip().split()
+    if len(parts) < 2:
+        await message.answer("Використання: /reset_exchange_spread mexc")
+        return
+
+    exchange = _normalize_exchange(parts[1])
+    if exchange is None:
+        await message.answer("Невідома біржа. Приклад: /reset_exchange_spread mexc")
+        return
+
+    deleted = delete_user_exchange_min_spread(message.from_user.id, exchange)
+    if deleted:
+        await message.answer(f"Окремий мінімальний спред для {exchange} скинуто.")
+    else:
+        await message.answer(f"Для {exchange} не було окремого мінімального спреду.")
+
+
+@dp.message(Command("exchange_spreads"))
+async def cmd_exchange_spreads(message: Message):
+    if not await ensure_allowed(message):
+        return
+    eff = get_effective_settings_for_user(message.from_user.id)
+    exchange_min_spreads = eff.get("exchange_min_spreads", {}) or {}
+    if not exchange_min_spreads:
+        await message.answer("Окремі мінімальні спреди для бірж не налаштовані.")
+        return
+
+    lines = [
+        f"{exchange}: {float(value):.2f}%"
+        for exchange, value in sorted(exchange_min_spreads.items())
+    ]
+    await message.answer("Мінімальні спреди для бірж:\n" + "\n".join(lines))
+
+
 @dp.message(SetSpreadState.waiting_value)
 async def process_spread_value(message: Message, state: FSMContext):
     if not await ensure_allowed(message):
@@ -411,6 +505,15 @@ async def process_spread_value(message: Message, state: FSMContext):
             return
         if text.startswith("/set_delta"):
             await cmd_set_delta(message, state)
+            return
+        if text.startswith("/set_exchange_spread"):
+            await cmd_set_exchange_spread(message)
+            return
+        if text.startswith("/reset_exchange_spread"):
+            await cmd_reset_exchange_spread(message)
+            return
+        if text.startswith("/exchange_spreads"):
+            await cmd_exchange_spreads(message)
             return
         if text.startswith("/blacklist_list"):
             await cmd_blacklist_list(message)
@@ -531,11 +634,18 @@ async def cmd_config(message: Message):
         return
     eff = get_effective_settings_for_user(message.from_user.id)
     exchanges = ", ".join(eff.get("exchanges", []))
+    exchange_min_spreads = eff.get("exchange_min_spreads", {}) or {}
+    exchange_spreads_text = (
+        "\n".join(f"{exchange}: {float(value):.2f}%" for exchange, value in sorted(exchange_min_spreads.items()))
+        if exchange_min_spreads
+        else "не налаштовані"
+    )
     await message.answer(
         (
             "<b>Поточний конфіг:</b>\n"
             f"Біржі: {exchanges}\n"
             f"Мінімальний спред: {eff.get('min_spread_pct')}\n"
+            f"Мінімальні спреди для бірж:\n{exchange_spreads_text}\n"
             f"Дельта сповіщень: {eff.get('delta_threshold_pct')}\n"
         )
     )
@@ -632,6 +742,15 @@ async def process_delta_value(message: Message, state: FSMContext):
         if text.startswith("/set_delta"):
             await cmd_set_delta(message, state)
             return
+        if text.startswith("/set_exchange_spread"):
+            await cmd_set_exchange_spread(message)
+            return
+        if text.startswith("/reset_exchange_spread"):
+            await cmd_reset_exchange_spread(message)
+            return
+        if text.startswith("/exchange_spreads"):
+            await cmd_exchange_spreads(message)
+            return
         if text.startswith("/blacklist_list"):
             await cmd_blacklist_list(message)
             return
@@ -665,6 +784,9 @@ async def on_startup() -> None:
             BotCommand(command="spreads", description="Запустити фоновий збір"),
             BotCommand(command="set_spread", description="Змінити мінімальний спред"),
             BotCommand(command="set_delta", description="Змінити поріг дельти"),
+            BotCommand(command="set_exchange_spread", description="Мінімальний спред для біржі"),
+            BotCommand(command="reset_exchange_spread", description="Скинути спред для біржі"),
+            BotCommand(command="exchange_spreads", description="Показати спреди для бірж"),
             BotCommand(command="exchanges", description="Вибір бірж"),
             BotCommand(command="config", description="Показати конфіг"),
             BotCommand(command="blacklist", description="Блок токена на час"),
