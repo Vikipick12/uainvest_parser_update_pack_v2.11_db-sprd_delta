@@ -40,6 +40,7 @@ def init_db(db_path: str = DEFAULT_DB_PATH) -> None:
                 exchanges_json  TEXT,
                 exchange_min_spreads_json TEXT,
                 delta_threshold_pct REAL,
+                special_delta_thresholds_json TEXT,
                 updated_at      INTEGER NOT NULL,
                 FOREIGN KEY(user_id) REFERENCES users(user_id) ON DELETE CASCADE
             )
@@ -52,6 +53,8 @@ def init_db(db_path: str = DEFAULT_DB_PATH) -> None:
             cur.execute("ALTER TABLE user_settings ADD COLUMN delta_threshold_pct REAL")
         if "exchange_min_spreads_json" not in existing_cols:
             cur.execute("ALTER TABLE user_settings ADD COLUMN exchange_min_spreads_json TEXT")
+        if "special_delta_thresholds_json" not in existing_cols:
+            cur.execute("ALTER TABLE user_settings ADD COLUMN special_delta_thresholds_json TEXT")
 
         # Per-opportunity state
         cur.execute(
@@ -129,7 +132,7 @@ def get_user_settings(
         cur = conn.cursor()
         cur.execute(
             """
-            SELECT min_spread_pct, exchanges_json, exchange_min_spreads_json, delta_threshold_pct
+            SELECT min_spread_pct, exchanges_json, exchange_min_spreads_json, delta_threshold_pct, special_delta_thresholds_json
             FROM user_settings
             WHERE user_id=?
             """,
@@ -142,6 +145,7 @@ def get_user_settings(
                 "exchanges": None,
                 "exchange_min_spreads": {},
                 "delta_threshold_pct": None,
+                "special_delta_thresholds": {},
             }
         exchanges = None
         if row["exchanges_json"]:
@@ -163,11 +167,24 @@ def get_user_settings(
                     }
             except (TypeError, ValueError, json.JSONDecodeError):
                 exchange_min_spreads = {}
+        special_delta_thresholds: Dict[str, float] = {}
+        if row["special_delta_thresholds_json"]:
+            try:
+                parsed_deltas = json.loads(row["special_delta_thresholds_json"])  # type: ignore[arg-type]
+                if isinstance(parsed_deltas, dict):
+                    special_delta_thresholds = {
+                        str(k).strip().upper(): float(v)
+                        for k, v in parsed_deltas.items()
+                        if str(k).strip()
+                    }
+            except (TypeError, ValueError, json.JSONDecodeError):
+                special_delta_thresholds = {}
         return {
             "min_spread_pct": row["min_spread_pct"],
             "exchanges": exchanges,
             "exchange_min_spreads": exchange_min_spreads,
             "delta_threshold_pct": row["delta_threshold_pct"],
+            "special_delta_thresholds": special_delta_thresholds,
         }
     finally:
         conn.close()
@@ -301,6 +318,75 @@ def upsert_last_spread_pct(
             (user_id, symbol, long_exchange, short_exchange, float(last_spread_pct), now),
         )
         conn.commit()
+    finally:
+        conn.close()
+
+
+def set_user_special_delta_threshold(
+    user_id: int,
+    symbol: str,
+    value: float,
+    *,
+    db_path: str = DEFAULT_DB_PATH,
+) -> None:
+    settings = get_user_settings(user_id, db_path=db_path)
+    special_delta_thresholds = dict(settings.get("special_delta_thresholds") or {})
+    normalized_symbol = str(symbol).strip().upper()
+    if not normalized_symbol:
+        return
+    special_delta_thresholds[normalized_symbol] = float(value)
+    special_delta_thresholds_json = json.dumps(special_delta_thresholds, ensure_ascii=False, sort_keys=True)
+
+    now = int(time.time())
+    conn = _connect(db_path)
+    try:
+        cur = conn.cursor()
+        cur.execute(
+            """
+            INSERT INTO user_settings (user_id, special_delta_thresholds_json, updated_at)
+            VALUES (?, ?, ?)
+            ON CONFLICT(user_id) DO UPDATE SET
+                special_delta_thresholds_json=excluded.special_delta_thresholds_json,
+                updated_at=excluded.updated_at
+            """,
+            (user_id, special_delta_thresholds_json, now),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def delete_user_special_delta_threshold(
+    user_id: int,
+    symbol: str,
+    *,
+    db_path: str = DEFAULT_DB_PATH,
+) -> bool:
+    settings = get_user_settings(user_id, db_path=db_path)
+    special_delta_thresholds = dict(settings.get("special_delta_thresholds") or {})
+    normalized_symbol = str(symbol).strip().upper()
+    if normalized_symbol not in special_delta_thresholds:
+        return False
+
+    special_delta_thresholds.pop(normalized_symbol, None)
+    special_delta_thresholds_json = json.dumps(special_delta_thresholds, ensure_ascii=False, sort_keys=True)
+
+    now = int(time.time())
+    conn = _connect(db_path)
+    try:
+        cur = conn.cursor()
+        cur.execute(
+            """
+            INSERT INTO user_settings (user_id, special_delta_thresholds_json, updated_at)
+            VALUES (?, ?, ?)
+            ON CONFLICT(user_id) DO UPDATE SET
+                special_delta_thresholds_json=excluded.special_delta_thresholds_json,
+                updated_at=excluded.updated_at
+            """,
+            (user_id, special_delta_thresholds_json, now),
+        )
+        conn.commit()
+        return True
     finally:
         conn.close()
 

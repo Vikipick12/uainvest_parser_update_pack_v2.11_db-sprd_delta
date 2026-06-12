@@ -23,6 +23,8 @@ from db import (
     set_user_min_spread,
     set_user_exchanges,
     set_user_delta_threshold,
+    set_user_special_delta_threshold,
+    delete_user_special_delta_threshold,
     set_user_exchange_min_spread,
     delete_user_exchange_min_spread,
     get_last_spread_pct,
@@ -85,6 +87,30 @@ class SetDeltaState(StatesGroup):
     waiting_value = State()
 
 
+class SetExchangeSpreadState(StatesGroup):
+    waiting_value = State()
+
+
+class ResetExchangeSpreadState(StatesGroup):
+    waiting_value = State()
+
+
+class SetSpecialDeltaState(StatesGroup):
+    waiting_value = State()
+
+
+class ResetSpecialDeltaState(StatesGroup):
+    waiting_value = State()
+
+
+class AddBlacklistState(StatesGroup):
+    waiting_value = State()
+
+
+class RemoveBlacklistState(StatesGroup):
+    waiting_value = State()
+
+
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
@@ -100,6 +126,17 @@ no_spreads_notified: Dict[int, bool] = {}
 global_fetch_task: Optional[asyncio.Task] = None
 
 
+BTN_SPREADS = "Показати спреди"
+BTN_STOP = "Зупинити"
+BTN_CONFIG = "Показати конфіг"
+BTN_EXCHANGES = "Вибір бірж"
+BTN_SET_SPREAD = "Мін. спред"
+BTN_SET_DELTA = "Глобальна дельта"
+BTN_EXCHANGE_THRESHOLDS = "Пороги бірж"
+BTN_SPECIAL_DELTAS = "Дельти тікерів"
+BTN_BLACKLIST = "Блекліст"
+
+
 def get_effective_settings_for_user(user_id: int) -> Dict[str, object]:
     cfg = load_config()
     user_cfg = get_user_settings(user_id)
@@ -111,12 +148,14 @@ def get_effective_settings_for_user(user_id: int) -> Dict[str, object]:
     min_spread_pct = float(user_min) if user_min is not None else float(cfg.get("min_spread_pct", 0.0))
     user_delta = user_cfg.get("delta_threshold_pct") if user_cfg else None
     delta_threshold_pct = float(user_delta) if user_delta is not None else 1.0
+    special_delta_thresholds = user_cfg.get("special_delta_thresholds") if user_cfg else {}
     exchange_min_spreads = user_cfg.get("exchange_min_spreads") if user_cfg else {}
     return {
         "exchanges": exchanges,
         "min_spread_pct": min_spread_pct,
         "exchange_min_spreads": exchange_min_spreads or {},
         "delta_threshold_pct": delta_threshold_pct,
+        "special_delta_thresholds": special_delta_thresholds or {},
         "data_path": str(cfg.get("data_path", "data.json")),
         "all_exchanges": all_exchanges,
     }
@@ -124,12 +163,44 @@ def get_effective_settings_for_user(user_id: int) -> Dict[str, object]:
 
 def build_main_menu_keyboard() -> ReplyKeyboardBuilder:
     kb = ReplyKeyboardBuilder()
-    kb.button(text="Показати спреди")
-    kb.button(text="Зміна спреду")
-    kb.button(text="Вибір бірж")
-    kb.button(text="Показати конфіг")
-    kb.adjust(2, 2)
+    kb.button(text=BTN_SPREADS)
+    kb.button(text=BTN_STOP)
+    kb.button(text=BTN_CONFIG)
+    kb.button(text=BTN_EXCHANGES)
+    kb.button(text=BTN_SET_SPREAD)
+    kb.button(text=BTN_SET_DELTA)
+    kb.button(text=BTN_EXCHANGE_THRESHOLDS)
+    kb.button(text=BTN_SPECIAL_DELTAS)
+    kb.button(text=BTN_BLACKLIST)
+    kb.adjust(2, 2, 2, 2, 1)
     return kb
+
+
+def build_exchange_thresholds_menu() -> InlineKeyboardBuilder:
+    builder = InlineKeyboardBuilder()
+    builder.button(text="Показати пороги", callback_data="exthr:list")
+    builder.button(text="Додати / змінити", callback_data="exthr:set")
+    builder.button(text="Скинути", callback_data="exthr:reset")
+    builder.adjust(1)
+    return builder
+
+
+def build_special_deltas_menu() -> InlineKeyboardBuilder:
+    builder = InlineKeyboardBuilder()
+    builder.button(text="Показати список", callback_data="sdelta:list")
+    builder.button(text="Додати / змінити", callback_data="sdelta:set")
+    builder.button(text="Скинути", callback_data="sdelta:reset")
+    builder.adjust(1)
+    return builder
+
+
+def build_blacklist_menu() -> InlineKeyboardBuilder:
+    builder = InlineKeyboardBuilder()
+    builder.button(text="Показати список", callback_data="bl:list")
+    builder.button(text="Додати тікер", callback_data="bl:add")
+    builder.button(text="Зняти тікер", callback_data="bl:remove")
+    builder.adjust(1)
+    return builder
 
 
 def build_exchanges_keyboard(selected: Set[str], all_exchanges: List[str]) -> InlineKeyboardBuilder:
@@ -248,6 +319,7 @@ async def start_background_loop(chat_id: int, user_id: int):
                 no_spreads_notified[chat_id] = False
                 # Send each opportunity as a separate message
                 delta_threshold = float(eff.get("delta_threshold_pct", 1.0))
+                special_delta_thresholds = eff.get("special_delta_thresholds", {}) or {}
                 sent_count = 0
                 for r in rows:
                     if MAX_ALERTS_PER_CYCLE > 0 and sent_count >= MAX_ALERTS_PER_CYCLE:
@@ -258,6 +330,9 @@ async def start_background_loop(chat_id: int, user_id: int):
                         symbol_upper = symbol.upper()
                         if symbol_upper and is_user_token_blacklisted(user_id, symbol_upper):
                             continue
+                        effective_delta_threshold = float(
+                            special_delta_thresholds.get(symbol_upper, delta_threshold)
+                        )
                         long_ex = str(r.get("long_exchange", ""))
                         short_ex = str(r.get("short_exchange", ""))
                         last = get_last_spread_pct(user_id, symbol, long_ex, short_ex)
@@ -266,7 +341,7 @@ async def start_background_loop(chat_id: int, user_id: int):
                             # First sighting for this user/opportunity
                             should_send = True
                         else:
-                            if abs(current - float(last)) >= delta_threshold:
+                            if abs(current - float(last)) >= effective_delta_threshold:
                                 should_send = True
                         if should_send:
                             await send_message_limited(chat_id, format_spread_card(r))
@@ -380,12 +455,22 @@ async def btn_spreads(message: Message):
     await cmd_spreads(message)
 
 
+@dp.message(F.text == BTN_STOP)
+async def btn_stop(message: Message):
+    await cmd_stop(message)
+
+
 @dp.message(Command("set_spread"))
 async def cmd_set_spread(message: Message, state: FSMContext):
     if not await ensure_allowed(message):
         return
     await state.set_state(SetSpreadState.waiting_value)
     await message.answer("Введіть мінімальний спред у %:")
+
+
+@dp.message(F.text == BTN_SET_SPREAD)
+async def btn_set_min_spread(message: Message, state: FSMContext):
+    await cmd_set_spread(message, state)
 
 
 def _parse_percent(text: str) -> Optional[float]:
@@ -421,6 +506,11 @@ def _normalize_exchange(raw: str) -> Optional[str]:
     exchange = str(raw or "").strip().lower()
     allowed = {ex.lower() for ex in ALL_EXCHANGES}
     return exchange if exchange in allowed else None
+
+
+def _normalize_symbol(raw: str) -> Optional[str]:
+    symbol = str(raw or "").strip().upper()
+    return symbol if symbol else None
 
 
 @dp.message(Command("set_exchange_spread"))
@@ -467,21 +557,91 @@ async def cmd_reset_exchange_spread(message: Message):
         await message.answer(f"Для {exchange} не було окремого мінімального спреду.")
 
 
-@dp.message(Command("exchange_spreads"))
-async def cmd_exchange_spreads(message: Message):
-    if not await ensure_allowed(message):
-        return
-    eff = get_effective_settings_for_user(message.from_user.id)
+async def send_exchange_spreads_list(target: Message, user_id: int) -> None:
+    eff = get_effective_settings_for_user(user_id)
     exchange_min_spreads = eff.get("exchange_min_spreads", {}) or {}
     if not exchange_min_spreads:
-        await message.answer("Окремі мінімальні спреди для бірж не налаштовані.")
+        await target.answer("Окремі мінімальні спреди для бірж не налаштовані.")
         return
 
     lines = [
         f"{exchange}: {float(value):.2f}%"
         for exchange, value in sorted(exchange_min_spreads.items())
     ]
-    await message.answer("Мінімальні спреди для бірж:\n" + "\n".join(lines))
+    await target.answer("Мінімальні спреди для бірж:\n" + "\n".join(lines))
+
+
+@dp.message(Command("exchange_spreads"))
+async def cmd_exchange_spreads(message: Message):
+    if not await ensure_allowed(message):
+        return
+    await send_exchange_spreads_list(message, message.from_user.id)
+
+
+@dp.message(Command("set_special_delta"))
+async def cmd_set_special_delta(message: Message):
+    if not await ensure_allowed(message):
+        return
+    parts = (message.text or "").strip().split()
+    if len(parts) < 3:
+        await message.answer("Використання: /set_special_delta BTCUSDT 4")
+        return
+
+    symbol = _normalize_symbol(parts[1])
+    if symbol is None:
+        await message.answer("Вкажіть символ. Приклад: /set_special_delta BTCUSDT 4")
+        return
+
+    value = _parse_percent(parts[2])
+    if value is None or value < 0:
+        await message.answer("Некоректна дельта. Приклад: /set_special_delta BTCUSDT 4")
+        return
+
+    set_user_special_delta_threshold(message.from_user.id, symbol, value)
+    await message.answer(f"Спеціальну дельту для {symbol} встановлено на {value:.2f}%")
+
+
+@dp.message(Command("reset_special_delta"))
+async def cmd_reset_special_delta(message: Message):
+    if not await ensure_allowed(message):
+        return
+    parts = (message.text or "").strip().split()
+    if len(parts) < 2:
+        await message.answer("Використання: /reset_special_delta BTCUSDT")
+        return
+
+    symbol = _normalize_symbol(parts[1])
+    if symbol is None:
+        await message.answer("Вкажіть символ. Приклад: /reset_special_delta BTCUSDT")
+        return
+
+    deleted = delete_user_special_delta_threshold(message.from_user.id, symbol)
+    if deleted:
+        await message.answer(f"Спеціальну дельту для {symbol} скинуто.")
+    else:
+        await message.answer(f"Для {symbol} не було спеціальної дельти.")
+
+
+async def send_special_deltas_list(target: Message, user_id: int) -> None:
+    eff = get_effective_settings_for_user(user_id)
+    special_delta_thresholds = eff.get("special_delta_thresholds", {}) or {}
+    if not special_delta_thresholds:
+        await target.answer("Спеціальні дельти для тікерів не налаштовані.")
+        return
+
+    lines = [
+        f"{symbol}: {float(value):.2f}%"
+        for symbol, value in sorted(special_delta_thresholds.items())
+    ]
+    await target.answer("Спеціальні дельти для тікерів:\n" + "\n".join(lines))
+
+
+@dp.message(Command("special_deltas"))
+@dp.message(Command("special_delta_list"))
+async def cmd_special_deltas(message: Message):
+    if not await ensure_allowed(message):
+        return
+    await send_special_deltas_list(message, message.from_user.id)
 
 
 @dp.message(SetSpreadState.waiting_value)
@@ -489,22 +649,45 @@ async def process_spread_value(message: Message, state: FSMContext):
     if not await ensure_allowed(message):
         return
     text = (message.text or "").strip()
-    if text.startswith("/") or text in {"Показати спреди", "Зміна спреду", "Вибір бірж", "Показати конфіг"}:
+    if text.startswith("/") or text in {
+        BTN_SPREADS,
+        "Зміна спреду",
+        BTN_SET_SPREAD,
+        BTN_SET_DELTA,
+        BTN_EXCHANGES,
+        BTN_CONFIG,
+        BTN_STOP,
+        BTN_EXCHANGE_THRESHOLDS,
+        BTN_SPECIAL_DELTAS,
+        BTN_BLACKLIST,
+    }:
         await state.clear()
-        if text == "Показати спреди" or text.startswith("/spreads"):
+        if text == BTN_SPREADS or text.startswith("/spreads"):
             await cmd_spreads(message)
             return
-        if text == "Зміна спреду" or text.startswith("/set_spread"):
+        if text in {"Зміна спреду", BTN_SET_SPREAD} or text.startswith("/set_spread"):
             await cmd_set_spread(message, state)
             return
-        if text == "Вибір бірж" or text.startswith("/exchanges"):
+        if text == BTN_SET_DELTA or text.startswith("/set_delta"):
+            await cmd_set_delta(message, state)
+            return
+        if text == BTN_EXCHANGES or text.startswith("/exchanges"):
             await cmd_exchanges(message, state)
             return
-        if text == "Показати конфіг" or text.startswith("/config"):
+        if text == BTN_CONFIG or text.startswith("/config"):
             await cmd_config(message)
             return
-        if text.startswith("/set_delta"):
-            await cmd_set_delta(message, state)
+        if text == BTN_STOP or text.startswith("/stop"):
+            await cmd_stop(message)
+            return
+        if text == BTN_EXCHANGE_THRESHOLDS:
+            await btn_exchange_thresholds(message)
+            return
+        if text == BTN_SPECIAL_DELTAS:
+            await btn_special_deltas_menu(message)
+            return
+        if text == BTN_BLACKLIST:
+            await btn_blacklist_menu(message)
             return
         if text.startswith("/set_exchange_spread"):
             await cmd_set_exchange_spread(message)
@@ -514,6 +697,15 @@ async def process_spread_value(message: Message, state: FSMContext):
             return
         if text.startswith("/exchange_spreads"):
             await cmd_exchange_spreads(message)
+            return
+        if text.startswith("/set_special_delta"):
+            await cmd_set_special_delta(message)
+            return
+        if text.startswith("/reset_special_delta"):
+            await cmd_reset_special_delta(message)
+            return
+        if text.startswith("/special_deltas") or text.startswith("/special_delta_list"):
+            await cmd_special_deltas(message)
             return
         if text.startswith("/blacklist_list"):
             await cmd_blacklist_list(message)
@@ -627,6 +819,241 @@ async def cancel_exchanges(cb: CallbackQuery, state: FSMContext):
     await state.clear()
 
 
+@dp.message(F.text == BTN_EXCHANGE_THRESHOLDS)
+async def btn_exchange_thresholds(message: Message):
+    if not await ensure_allowed(message):
+        return
+    await message.answer("Пороги бірж:", reply_markup=build_exchange_thresholds_menu().as_markup())
+
+
+@dp.callback_query(F.data == "exthr:list")
+async def cb_exchange_thresholds_list(cb: CallbackQuery):
+    if not user_allowed(cb.from_user.id):
+        await cb.answer("Доступ заборонений", show_alert=True)
+        return
+    await send_exchange_spreads_list(cb.message, cb.from_user.id)
+    await cb.answer()
+
+
+@dp.callback_query(F.data == "exthr:set")
+async def cb_exchange_thresholds_set(cb: CallbackQuery, state: FSMContext):
+    if not user_allowed(cb.from_user.id):
+        await cb.answer("Доступ заборонений", show_alert=True)
+        return
+    await state.set_state(SetExchangeSpreadState.waiting_value)
+    await cb.message.answer("Введіть біржу і мінімальний спред, наприклад: mexc 10")
+    await cb.answer()
+
+
+@dp.callback_query(F.data == "exthr:reset")
+async def cb_exchange_thresholds_reset(cb: CallbackQuery, state: FSMContext):
+    if not user_allowed(cb.from_user.id):
+        await cb.answer("Доступ заборонений", show_alert=True)
+        return
+    await state.set_state(ResetExchangeSpreadState.waiting_value)
+    await cb.message.answer("Введіть біржу для скидання, наприклад: mexc")
+    await cb.answer()
+
+
+@dp.message(F.text == BTN_SPECIAL_DELTAS)
+async def btn_special_deltas_menu(message: Message):
+    if not await ensure_allowed(message):
+        return
+    await message.answer("Дельти тікерів:", reply_markup=build_special_deltas_menu().as_markup())
+
+
+@dp.callback_query(F.data == "sdelta:list")
+async def cb_special_deltas_list(cb: CallbackQuery):
+    if not user_allowed(cb.from_user.id):
+        await cb.answer("Доступ заборонений", show_alert=True)
+        return
+    await send_special_deltas_list(cb.message, cb.from_user.id)
+    await cb.answer()
+
+
+@dp.callback_query(F.data == "sdelta:set")
+async def cb_special_deltas_set(cb: CallbackQuery, state: FSMContext):
+    if not user_allowed(cb.from_user.id):
+        await cb.answer("Доступ заборонений", show_alert=True)
+        return
+    await state.set_state(SetSpecialDeltaState.waiting_value)
+    await cb.message.answer("Введіть тікер і дельту, наприклад: BTCUSDT 4")
+    await cb.answer()
+
+
+@dp.callback_query(F.data == "sdelta:reset")
+async def cb_special_deltas_reset(cb: CallbackQuery, state: FSMContext):
+    if not user_allowed(cb.from_user.id):
+        await cb.answer("Доступ заборонений", show_alert=True)
+        return
+    await state.set_state(ResetSpecialDeltaState.waiting_value)
+    await cb.message.answer("Введіть тікер для скидання, наприклад: BTCUSDT")
+    await cb.answer()
+
+
+@dp.message(F.text == BTN_BLACKLIST)
+async def btn_blacklist_menu(message: Message):
+    if not await ensure_allowed(message):
+        return
+    await message.answer("Блекліст:", reply_markup=build_blacklist_menu().as_markup())
+
+
+@dp.callback_query(F.data == "bl:list")
+async def cb_blacklist_list(cb: CallbackQuery):
+    if not user_allowed(cb.from_user.id):
+        await cb.answer("Доступ заборонений", show_alert=True)
+        return
+    await send_blacklist_list(cb.message, cb.from_user.id)
+    await cb.answer()
+
+
+@dp.callback_query(F.data == "bl:add")
+async def cb_blacklist_add(cb: CallbackQuery, state: FSMContext):
+    if not user_allowed(cb.from_user.id):
+        await cb.answer("Доступ заборонений", show_alert=True)
+        return
+    await state.set_state(AddBlacklistState.waiting_value)
+    await cb.message.answer("Введіть тікер і тривалість, наприклад: BTCUSDT 24h")
+    await cb.answer()
+
+
+@dp.callback_query(F.data == "bl:remove")
+async def cb_blacklist_remove(cb: CallbackQuery, state: FSMContext):
+    if not user_allowed(cb.from_user.id):
+        await cb.answer("Доступ заборонений", show_alert=True)
+        return
+    await state.set_state(RemoveBlacklistState.waiting_value)
+    await cb.message.answer("Введіть тікер для зняття з блекліста, наприклад: BTCUSDT")
+    await cb.answer()
+
+
+@dp.message(SetExchangeSpreadState.waiting_value)
+async def process_exchange_spread_button_value(message: Message, state: FSMContext):
+    if not await ensure_allowed(message):
+        return
+    parts = (message.text or "").strip().split()
+    if len(parts) < 2:
+        await message.answer("Введіть біржу і відсоток, наприклад: mexc 10")
+        return
+
+    exchange = _normalize_exchange(parts[0])
+    if exchange is None:
+        await message.answer("Невідома біржа. Приклад: mexc 10")
+        return
+
+    value = _parse_percent(parts[1])
+    if value is None or value < 0:
+        await message.answer("Некоректний відсоток. Приклад: mexc 10")
+        return
+
+    set_user_exchange_min_spread(message.from_user.id, exchange, value)
+    await message.answer(f"Мінімальний спред для {exchange} встановлено на {value:.2f}%")
+    await state.clear()
+
+
+@dp.message(ResetExchangeSpreadState.waiting_value)
+async def process_exchange_spread_reset_value(message: Message, state: FSMContext):
+    if not await ensure_allowed(message):
+        return
+    exchange = _normalize_exchange((message.text or "").strip().split()[0] if (message.text or "").strip() else "")
+    if exchange is None:
+        await message.answer("Введіть біржу для скидання, наприклад: mexc")
+        return
+
+    deleted = delete_user_exchange_min_spread(message.from_user.id, exchange)
+    if deleted:
+        await message.answer(f"Окремий мінімальний спред для {exchange} скинуто.")
+    else:
+        await message.answer(f"Для {exchange} не було окремого мінімального спреду.")
+    await state.clear()
+
+
+@dp.message(SetSpecialDeltaState.waiting_value)
+async def process_special_delta_button_value(message: Message, state: FSMContext):
+    if not await ensure_allowed(message):
+        return
+    parts = (message.text or "").strip().split()
+    if len(parts) < 2:
+        await message.answer("Введіть тікер і дельту, наприклад: BTCUSDT 4")
+        return
+
+    symbol = _normalize_symbol(parts[0])
+    if symbol is None:
+        await message.answer("Вкажіть тікер. Приклад: BTCUSDT 4")
+        return
+
+    value = _parse_percent(parts[1])
+    if value is None or value < 0:
+        await message.answer("Некоректна дельта. Приклад: BTCUSDT 4")
+        return
+
+    set_user_special_delta_threshold(message.from_user.id, symbol, value)
+    await message.answer(f"Спеціальну дельту для {symbol} встановлено на {value:.2f}%")
+    await state.clear()
+
+
+@dp.message(ResetSpecialDeltaState.waiting_value)
+async def process_special_delta_reset_value(message: Message, state: FSMContext):
+    if not await ensure_allowed(message):
+        return
+    symbol = _normalize_symbol((message.text or "").strip().split()[0] if (message.text or "").strip() else "")
+    if symbol is None:
+        await message.answer("Введіть тікер для скидання, наприклад: BTCUSDT")
+        return
+
+    deleted = delete_user_special_delta_threshold(message.from_user.id, symbol)
+    if deleted:
+        await message.answer(f"Спеціальну дельту для {symbol} скинуто.")
+    else:
+        await message.answer(f"Для {symbol} не було спеціальної дельти.")
+    await state.clear()
+
+
+@dp.message(AddBlacklistState.waiting_value)
+async def process_blacklist_add_value(message: Message, state: FSMContext):
+    if not await ensure_allowed(message):
+        return
+    parts = (message.text or "").strip().split()
+    if not parts:
+        await message.answer("Введіть тікер і тривалість, наприклад: BTCUSDT 24h")
+        return
+
+    symbol = _normalize_symbol(parts[0])
+    if symbol is None:
+        await message.answer("Вкажіть тікер. Приклад: BTCUSDT 24h")
+        return
+
+    hours = 24
+    if len(parts) >= 2:
+        parsed_hours = _parse_blacklist_duration_hours(parts[1])
+        if parsed_hours is None or parsed_hours <= 0:
+            await message.answer("Некоректна тривалість. Використовуйте: 24h, 24, 1d, 90m")
+            return
+        hours = parsed_hours
+
+    expires_at = int(time.time()) + (hours * 3600)
+    upsert_user_token_blacklist(message.from_user.id, symbol, expires_at)
+    await message.answer(f"Токен {symbol} вимкнено на {hours} год.")
+    await state.clear()
+
+
+@dp.message(RemoveBlacklistState.waiting_value)
+async def process_blacklist_remove_value(message: Message, state: FSMContext):
+    if not await ensure_allowed(message):
+        return
+    symbol = _normalize_symbol((message.text or "").strip().split()[0] if (message.text or "").strip() else "")
+    if symbol is None:
+        await message.answer("Введіть тікер для зняття з блекліста, наприклад: BTCUSDT")
+        return
+
+    deleted = delete_user_token_blacklist(message.from_user.id, symbol)
+    if deleted:
+        await message.answer(f"Блокування для {symbol} знято.")
+    else:
+        await message.answer(f"{symbol} не був у блеклісті.")
+    await state.clear()
+
+
 @dp.message(F.text == "Показати конфіг")
 @dp.message(Command("config"))
 async def cmd_config(message: Message):
@@ -635,18 +1062,40 @@ async def cmd_config(message: Message):
     eff = get_effective_settings_for_user(message.from_user.id)
     exchanges = ", ".join(eff.get("exchanges", []))
     exchange_min_spreads = eff.get("exchange_min_spreads", {}) or {}
+    special_delta_thresholds = eff.get("special_delta_thresholds", {}) or {}
+    blacklist_rows = list_user_token_blacklist(message.from_user.id)
     exchange_spreads_text = (
         "\n".join(f"{exchange}: {float(value):.2f}%" for exchange, value in sorted(exchange_min_spreads.items()))
         if exchange_min_spreads
         else "не налаштовані"
     )
+    special_deltas_text = (
+        "\n".join(f"{symbol}: {float(value):.2f}%" for symbol, value in sorted(special_delta_thresholds.items()))
+        if special_delta_thresholds
+        else "не налаштовані"
+    )
+    now = int(time.time())
+    blacklist_text = (
+        "\n".join(
+            f"{symbol}: {max(1, (int(expires_at) - now + 3599) // 3600)}h"
+            for symbol, expires_at in blacklist_rows
+        )
+        if blacklist_rows
+        else "не налаштований"
+    )
+    sep = "\n---------------------------------------------\n"
     await message.answer(
         (
             "<b>Поточний конфіг:</b>\n"
-            f"Біржі: {exchanges}\n"
+            f"Біржі: {exchanges}"
+            f"{sep}"
             f"Мінімальний спред: {eff.get('min_spread_pct')}\n"
-            f"Мінімальні спреди для бірж:\n{exchange_spreads_text}\n"
+            f"Мінімальні спреди для бірж:\n{exchange_spreads_text}"
+            f"{sep}"
             f"Дельта сповіщень: {eff.get('delta_threshold_pct')}\n"
+            f"Спеціальні дельти:\n{special_deltas_text}"
+            f"{sep}"
+            f"Чорний список:\n{blacklist_text}"
         )
     )
 
@@ -695,13 +1144,10 @@ async def cmd_unblacklist(message: Message):
         await message.answer(f"{symbol} не був у блеклисті.")
 
 
-@dp.message(Command("blacklist_list"))
-async def cmd_blacklist_list(message: Message):
-    if not await ensure_allowed(message):
-        return
-    rows = list_user_token_blacklist(message.from_user.id)
+async def send_blacklist_list(target: Message, user_id: int) -> None:
+    rows = list_user_token_blacklist(user_id)
     if not rows:
-        await message.answer("Блекліст порожній.")
+        await target.answer("Блекліст порожній.")
         return
     now = int(time.time())
     lines: List[str] = []
@@ -709,7 +1155,14 @@ async def cmd_blacklist_list(message: Message):
         left_seconds = max(0, int(expires_at) - now)
         left_hours = left_seconds / 3600.0
         lines.append(f"{symbol}: залишилось {left_hours:.1f} год.")
-    await message.answer("Заблоковані токени:\n" + "\n".join(lines))
+    await target.answer("Заблоковані токени:\n" + "\n".join(lines))
+
+
+@dp.message(Command("blacklist_list"))
+async def cmd_blacklist_list(message: Message):
+    if not await ensure_allowed(message):
+        return
+    await send_blacklist_list(message, message.from_user.id)
 
 
 @dp.message(Command("set_delta"))
@@ -720,27 +1173,55 @@ async def cmd_set_delta(message: Message, state: FSMContext):
     await message.answer("Введіть дельту у % (поріг зміни спреду для сповіщення):")
 
 
+@dp.message(F.text == BTN_SET_DELTA)
+async def btn_set_delta(message: Message, state: FSMContext):
+    await cmd_set_delta(message, state)
+
+
 @dp.message(SetDeltaState.waiting_value)
 async def process_delta_value(message: Message, state: FSMContext):
     if not await ensure_allowed(message):
         return
     text = (message.text or "").strip()
-    if text.startswith("/") or text in {"Показати спреди", "Зміна спреду", "Вибір бірж", "Показати конфіг"}:
+    if text.startswith("/") or text in {
+        BTN_SPREADS,
+        "Зміна спреду",
+        BTN_SET_SPREAD,
+        BTN_SET_DELTA,
+        BTN_EXCHANGES,
+        BTN_CONFIG,
+        BTN_STOP,
+        BTN_EXCHANGE_THRESHOLDS,
+        BTN_SPECIAL_DELTAS,
+        BTN_BLACKLIST,
+    }:
         await state.clear()
-        if text == "Показати спреди" or text.startswith("/spreads"):
+        if text == BTN_SPREADS or text.startswith("/spreads"):
             await cmd_spreads(message)
             return
-        if text == "Зміна спреду" or text.startswith("/set_spread"):
+        if text in {"Зміна спреду", BTN_SET_SPREAD} or text.startswith("/set_spread"):
             await cmd_set_spread(message, state)
             return
-        if text == "Вибір бірж" or text.startswith("/exchanges"):
+        if text == BTN_SET_DELTA or text.startswith("/set_delta"):
+            await cmd_set_delta(message, state)
+            return
+        if text == BTN_EXCHANGES or text.startswith("/exchanges"):
             await cmd_exchanges(message, state)
             return
-        if text == "Показати конфіг" or text.startswith("/config"):
+        if text == BTN_CONFIG or text.startswith("/config"):
             await cmd_config(message)
             return
-        if text.startswith("/set_delta"):
-            await cmd_set_delta(message, state)
+        if text == BTN_STOP or text.startswith("/stop"):
+            await cmd_stop(message)
+            return
+        if text == BTN_EXCHANGE_THRESHOLDS:
+            await btn_exchange_thresholds(message)
+            return
+        if text == BTN_SPECIAL_DELTAS:
+            await btn_special_deltas_menu(message)
+            return
+        if text == BTN_BLACKLIST:
+            await btn_blacklist_menu(message)
             return
         if text.startswith("/set_exchange_spread"):
             await cmd_set_exchange_spread(message)
@@ -750,6 +1231,15 @@ async def process_delta_value(message: Message, state: FSMContext):
             return
         if text.startswith("/exchange_spreads"):
             await cmd_exchange_spreads(message)
+            return
+        if text.startswith("/set_special_delta"):
+            await cmd_set_special_delta(message)
+            return
+        if text.startswith("/reset_special_delta"):
+            await cmd_reset_special_delta(message)
+            return
+        if text.startswith("/special_deltas") or text.startswith("/special_delta_list"):
+            await cmd_special_deltas(message)
             return
         if text.startswith("/blacklist_list"):
             await cmd_blacklist_list(message)
@@ -793,6 +1283,9 @@ async def on_startup() -> None:
             BotCommand(command="unblacklist", description="Зняти блок токена"),
             BotCommand(command="blacklist_list", description="Список заблокованих"),
             BotCommand(command="stop", description="Зупинити надсилання у цьому чаті"),
+            BotCommand(command="set_special_delta", description="Дельта для окремого тікера"),
+            BotCommand(command="reset_special_delta", description="Скинути дельту тікера"),
+            BotCommand(command="special_deltas", description="Показати дельти тікерів"),
         ]
     )
     await ensure_global_fetcher_started()
